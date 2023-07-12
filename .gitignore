@@ -1,0 +1,6 @@
+build/
+storage/
+.idea/
+.aptos/
+.trace
+.coverage_map.mvcov

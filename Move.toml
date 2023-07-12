@@ -1,0 +1,17 @@
+[package]
+name = "flex_staking"
+version = "1.0.0"
+
+[addresses]
+aptos_std = "0x1"
+quest = "0x9771"
+
+[dependencies.AptosFramework]
+git = 'https://github.com/aptos-labs/aptos-core.git'
+rev = 'aptos-node-v1.5.0'
+subdir = 'aptos-move/framework/aptos-framework'
+
+[dependencies.MoveStdlib]
+git = 'https://github.com/aptos-labs/aptos-core.git'
+rev = 'aptos-node-v1.5.0'
+subdir = 'aptos-move/framework/move-stdlib'
