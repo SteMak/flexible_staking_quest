@@ -1,5 +1,8 @@
 # Fix Issues in Flexible Staking
 
+## Disclaimer
+The `sources/flex_staking_quest.move.solution` file contains one of the possible solutions to the quest. For greater efficiency, I strongly recommend trying to solve the problem by yourself first and then comparing your solution with this example, analyzing its operating principle.
+
 ## Story
 You have excelled in a lot of developers competitions and have become a proficient Smart Contracts Developer. Your first commercial project involves developing a flexible staking smart contract. After quickly coding the contract and preparing for deployment, an independent Smart Contracts Auditor contacted you with the following message:
 
