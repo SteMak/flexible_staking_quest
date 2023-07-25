@@ -1,0 +1,326 @@
+// Target contract that needs minor adjustments to be safe
+module quest::flex_staking {
+    // Imports section
+    use aptos_std::account::{ Self, SignerCapability };
+    use aptos_std::coin::{ Self, MintCapability, BurnCapability };
+    use aptos_std::error;
+    use aptos_std::option;
+    use aptos_std::signer;
+    use aptos_std::string;
+
+    // The CoinType may be changed in the future, so an alias is used
+    use aptos_std::aptos_coin::AptosCoin as StakeCoin;
+
+    // Errors section
+    const ERROR_INCORRECT_INITIALIZER: u64 = 1;
+    const ERROR_INSUFFICIENT_BALANCE: u64 = 2;
+
+    // Seed for the resource account
+    const SEED: vector<u8> = b"CapsStorage";
+
+    // Base liquidity amount to prevent convert rate manipulations
+    const BASE_LIQUIDITY: u64 = 10 * 100_000_000;
+
+    // CoinType for deposit shares
+    struct ShareCoin { }
+
+    // Contract state structure containing different capability objects
+    struct Capabilities has key {
+        burn_cap: BurnCapability<ShareCoin>,
+        mint_cap: MintCapability<ShareCoin>,
+        resource_cap: SignerCapability,
+    }
+
+    // TODO: Update the functions to resolve the issues mentioned in the README:
+    // TODO  - front-running attack
+    // TODO  - convert rate manipulation
+    // TODO: TIP At first show the existence of these issues by finalizing the tests below
+
+    // Smart contract constructor, which is automatically called on deployment
+    fun init_module(initializer: &signer) {
+        init_internal(initializer, BASE_LIQUIDITY);
+    }
+
+    // Initializes the module, sets up the capabilities for minting, burning, and creates a resource account
+    fun init_internal(initializer: &signer, base: u64) {
+        // Sanity caller check
+        assert_initializer(initializer);
+
+        // Create ShareCoin metadata
+        let (burn_cap, freeze_cap, mint_cap) = coin::initialize<ShareCoin>(
+            initializer,
+            string::utf8(b"ShareCoin"),  // Set the name of the coin
+            string::utf8(b"MIND_SHARE"),  // Set the symbol of the coin
+            coin::decimals<StakeCoin>(),  // Set the decimal places of the coin equal to StakeCoin
+            true,  // Enable total supply feature
+        );
+        coin::destroy_freeze_cap(freeze_cap);  // Destroy the freeze capability as it's not used
+
+        // Create a resource account for storing user funds
+        let (resource_signer, resource_cap) = account::create_resource_account(initializer, SEED);
+        // Register the resource account for StakeCoin to accept incoming transfers
+        coin::register<StakeCoin>(&resource_signer);
+
+        // Deposit base liquidity
+        if (base > 0) {
+            // Transfer StakeCoin
+            coin::transfer<StakeCoin>(initializer, signer::address_of(&resource_signer), base);
+
+            // Mint ShareCoin
+            let token = coin::mint<ShareCoin>(base, &mint_cap);
+            coin::register<ShareCoin>(&resource_signer);
+            coin::deposit<ShareCoin>(signer::address_of(&resource_signer), token);
+        };
+
+        // Save necessary data to state
+        move_to(initializer, Capabilities {
+            burn_cap,
+            mint_cap,
+            resource_cap,
+        });
+    }
+
+    // Deposits the specified amount of StakeCoin into the contract
+    entry public fun deposit(user: &signer, amount: u64) acquires Capabilities {
+        let user_address = signer::address_of(user);
+
+        // Sanity caller balance check
+        assert_balance<StakeCoin>(user_address, amount);
+
+        // Convert the specified amount of StakeCoin to the equivalent amount of ShareCoin
+        let amount_to_mint = get_converted(amount, true);
+
+        // Calculating the minimum StakeCoin amount that is needed for minting amount_to_mint of ShareCoin
+        let amount = get_converted(amount_to_mint, false);
+        if (get_converted(amount, true) != amount_to_mint) amount = amount + 1;
+
+        let caps = get_caps();  // Get capabilities
+        // Get resource account data
+        let resource_signer = &account::create_signer_with_capability(&caps.resource_cap);
+        let resource_address = signer::address_of(resource_signer);
+
+        // Transfer the StakeCoin from the user to the resource account
+        coin::transfer<StakeCoin>(user, resource_address, amount);
+
+        // Mint the corresponding amount of ShareCoin
+        let token = coin::mint<ShareCoin>(amount_to_mint, &caps.mint_cap);
+        coin::register<ShareCoin>(user);  // Register the user for ShareCoin if needed
+        coin::deposit<ShareCoin>(user_address, token);  // Deposit the minted ShareCoin to the user's account
+    }
+
+    // Withdraws the specified amount of StakeCoin from the contract
+    entry public fun withdraw(user: &signer, amount: u64) acquires Capabilities {
+        let user_address = signer::address_of(user);
+
+        // Sanity caller balance check
+        assert_balance<ShareCoin>(user_address, amount);
+
+        // Convert the specified amount of ShareCoin to the equivalent amount of StakeCoin
+        let amount_to_withdraw = get_converted(amount, false);
+
+        let caps = get_caps();  // Get capabilities
+        // Get resource account data
+        let resource_signer = &account::create_signer_with_capability(&caps.resource_cap);
+
+        // Withdraw the corresponding amount of ShareCoin from the user's account
+        let token = coin::withdraw<ShareCoin>(user, amount);
+        coin::burn<ShareCoin>(token, &caps.burn_cap);  // Burn the withdrawn ShareCoin
+
+        // Transfer the equivalent amount of StakeCoin to the user
+        coin::transfer<StakeCoin>(resource_signer, user_address, amount_to_withdraw);
+    }
+
+    // Burns the specified amount of ShareCoin
+    entry public fun burn(user: &signer, amount: u64) acquires Capabilities {
+        let caps = get_caps();  // Get capabilities
+
+        // Withdraw the specified amount of ShareCoin from the user
+        let token = coin::withdraw<ShareCoin>(user, amount);
+        coin::burn<ShareCoin>(token, &caps.burn_cap);  // Burn the withdrawn ShareCoin
+    }
+
+    // Converts the specified amount between ShareCoin and StakeCoin based on the reverse flag
+    #[view]
+    public fun get_converted(amount: u64, reverse: bool): u64 acquires Capabilities {
+        let caps = get_caps();  // Get capabilities
+
+        // Get resource account data
+        let resource_signer = &account::create_signer_with_capability(&caps.resource_cap);
+        let resource_address = signer::address_of(resource_signer);
+
+        let shares_supply = *option::borrow(&coin::supply<ShareCoin>());  // Get the total supply of ShareCoin
+        // Get the total amount of StakeCoin staked in the contract
+        let total_staked = coin::balance<StakeCoin>(resource_address);
+
+        // If there's no supply or staked amount, return the original amount
+        if (shares_supply == 0 || total_staked == 0) return amount;
+
+        // Convert from StakeCoin to ShareCoin
+        // It is safely converted to u64 as shares_supply < total_staked
+        if (reverse) ((amount as u128) * shares_supply / (total_staked as u128) as u64)
+        // Convert from ShareCoin to StakeCoin
+        // It is safely converted to u64 as amount < shares_supply
+        else ((amount as u128) * (total_staked as u128) / shares_supply as u64)
+    }
+
+    // Asserts that the initializer is correct
+    inline fun assert_initializer(initializer: &signer) {
+        assert!(signer::address_of(initializer) == @quest, error::permission_denied(ERROR_INCORRECT_INITIALIZER));
+    }
+
+    // Asserts that the user has enough funds
+    inline fun assert_balance<CoinType>(user_address: address, amount: u64) {
+        assert!(coin::balance<CoinType>(user_address) >= amount, error::invalid_argument(ERROR_INSUFFICIENT_BALANCE));
+    }
+
+    // Retrieves the capabilities for the contract
+    inline fun get_caps(): &Capabilities acquires Capabilities {
+        borrow_global<Capabilities>(@quest)
+    }
+
+    // Initializes the module for testing purposes
+    #[test_only]
+    public fun init_for_test(initializer: &signer) {
+        init_internal(initializer, 0);
+    }
+
+    // Initializes the module for testing purposes using high-level interface
+    #[test_only]
+    public fun init_module_for_test(initializer: &signer) {
+        init_module(initializer);
+    }
+
+    // Retrieves the resource seed for testing purposes
+    #[test_only]
+    public fun resource_seed(): vector<u8> {
+        SEED
+    }
+
+    // Retrieves the base liquidity amount for testing purposes
+    #[test_only]
+    public fun base_liquidity(): u64 {
+        BASE_LIQUIDITY
+    }
+}
+
+// Target testing module that needs to be fulfilled with some tests
+#[test_only]
+module quest::flex_staking_custom_tests {
+    // Imports section
+    use aptos_std::account;
+    use aptos_std::coin;
+    use aptos_std::signer;
+
+    use aptos_std::aptos_coin as staked_coin;
+    use aptos_std::aptos_coin::AptosCoin as StakeCoin;
+
+    use quest::flex_staking::{ Self, ShareCoin, resource_seed };
+
+    // Default balance constants
+    const DECIMALS: u64 = 100_000_000;
+    const ATTACKER_BALANCE: u64 = 10_000_000 * 100_000_000;
+    const USER_BALANCE: u64 = 10_000 * 100_000_000;
+
+    // Test template
+    #[test(aptos_std = @aptos_std, source = @quest, attacker = @0x4756, user = @0x7776)]
+    fun frontrun_attack(aptos_std: &signer, source: &signer, attacker: &signer, user: &signer) {
+        // Initialize the staked_coin module for testing
+        let (burn_cap, mint_cap) = staked_coin::initialize_for_test(aptos_std);
+        flex_staking::init_for_test(source);  // Initialize the Flex Staking module for testing
+
+        let attacker_address = signer::address_of(attacker);
+        account::create_account_for_test(attacker_address);  // Create a test account for the attacker
+        coin::register<StakeCoin>(attacker);  // Register the attacker for StakeCoin
+        // Mint a large (but reasonable) amount of StakeCoin for the attacker
+        staked_coin::mint(aptos_std, attacker_address, ATTACKER_BALANCE);
+
+        let user_address = signer::address_of(user);
+        account::create_account_for_test(user_address);  // Create a test account for the user
+        coin::register<StakeCoin>(user);  // Register the user for StakeCoin
+        coin::register<ShareCoin>(user);  // Register the user for ShareCoin (optional)
+        // Mint a normal amount of StakeCoin for the user
+        staked_coin::mint(aptos_std, user_address, USER_BALANCE);
+
+        let source_address = signer::address_of(source);
+        account::create_account_for_test(source_address);  // Create a test account for the source
+        coin::register<StakeCoin>(source);  // Register the source for StakeCoin
+        // Mint a normal amount of StakeCoin for the source
+        staked_coin::mint(aptos_std, source_address, USER_BALANCE);
+
+        // Get resource account data
+        let resource_address = account::create_resource_address(&source_address, resource_seed());
+        resource_address;  // Silent unused variable error
+
+        coin::destroy_burn_cap(burn_cap);  // Destroy the burn capability as not needed anymore
+        coin::destroy_mint_cap(mint_cap);  // Destroy the mint capability as not needed anymore
+
+        // TODO: Finalize the test
+        // TODO: TIP Check various interaction flows and identify if the attacker receives unexpected profit
+        // TODO: TIP User funds should not be wasted independently on the convert rate
+
+        // The test requires user should pay only for received share tokens and
+        // all other tokens should be given back
+        // In such a way no user funds are pumping the convert rate and the attacker doesn't receive any profit
+
+        flex_staking::deposit(attacker, USER_BALANCE / 8 + 1);
+        assert!(coin::balance<ShareCoin>(attacker_address) == USER_BALANCE / 8 + 1, 0);
+
+        flex_staking::burn(attacker, USER_BALANCE / 8);
+        assert!(coin::balance<ShareCoin>(attacker_address) == 1, 0);
+
+        flex_staking::deposit(user, USER_BALANCE / 8);
+        assert!(coin::balance<ShareCoin>(user_address) == 0, 0);
+        assert!(coin::balance<StakeCoin>(user_address) == USER_BALANCE, 0);
+
+        flex_staking::deposit(user, 5 * USER_BALANCE / 16);
+        assert!(coin::balance<ShareCoin>(user_address) == 2, 0);
+        assert!(coin::balance<StakeCoin>(user_address) == USER_BALANCE - 2 * (USER_BALANCE / 8 + 1), 0);
+
+        coin::transfer<StakeCoin>(source, resource_address, 7);
+
+        flex_staking::deposit(user, USER_BALANCE - 2 * (USER_BALANCE / 8 + 1));
+        assert!(coin::balance<ShareCoin>(user_address) == 7, 0);
+        assert!(coin::balance<StakeCoin>(user_address) == USER_BALANCE - 7 * (USER_BALANCE / 8 + 1) - 12, 0);
+    }
+
+    // Test template
+    #[test(aptos_std = @aptos_std, source = @quest, attacker = @0x4756, user = @0x7776)]
+    fun get_converted_manipulation(aptos_std: &signer, source: &signer, attacker: &signer) {
+        // Initialize the staked_coin module for testing
+        let (burn_cap, mint_cap) = staked_coin::initialize_for_test(aptos_std);
+
+        let attacker_address = signer::address_of(attacker);
+        account::create_account_for_test(attacker_address);  // Create a test account for the attacker
+        coin::register<StakeCoin>(attacker);  // Register the attacker for StakeCoin
+        // Mint a large (but reasonable) amount of StakeCoin for the attacker
+        staked_coin::mint(aptos_std, attacker_address, ATTACKER_BALANCE);
+
+        let source_address = signer::address_of(source);
+        account::create_account_for_test(source_address);  // Create a test account for the source
+        coin::register<StakeCoin>(source);  // Register the source for StakeCoin
+        // Mint a normal amount of StakeCoin for the source
+        staked_coin::mint(aptos_std, source_address, USER_BALANCE);
+
+        // Provide some tokens as initial liquidity (10 * 10^decimals StakeCoin)
+        flex_staking::init_module_for_test(source);  // Initialize the Flex Staking module for testing
+
+        coin::destroy_burn_cap(burn_cap);  // Destroy the burn capability as not needed anymore
+        coin::destroy_mint_cap(mint_cap);  // Destroy the mint capability as not needed anymore
+
+        // TODO: Finalize the test
+        // TODO: TIP The impact of burning assets is the most significant when the liquidity amount is low
+
+        // The test requires the convert rate to not be changed more than 10_000 times
+        // despite 50_000 * 10^decimals StakeCoin are thrown in
+
+        flex_staking::deposit(attacker, 50_000 * DECIMALS);
+
+        assert!(flex_staking::get_converted(1, false) == 1, 0);
+        assert!(flex_staking::get_converted(10_000, true) == 10_000, 0);
+
+        flex_staking::burn(attacker, 50_000 * DECIMALS - 1);
+
+        assert!(flex_staking::get_converted(1, false) < 10_000, 0);
+        assert!(flex_staking::get_converted(10_000, true) > 0, 0);
+    }
+}
